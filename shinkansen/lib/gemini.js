@@ -4,8 +4,36 @@
 import { debugLog } from './logger.js';
 
 const DELIMITER = '\n<<<SHINKANSEN_SEP>>>\n';
-const CHUNK_SIZE = 20; // 每批最多送幾段（content.js 已經會分批，這裡只是雙重保險）
+// v0.37 起改為「段數 + 字元預算」雙門檻（雙重保險層 — content.js 已先打包過）
+const MAX_UNITS_PER_CHUNK = 20;
+const MAX_CHARS_PER_CHUNK = 3500;
 const MAX_BACKOFF_MS = 8000;
+
+/**
+ * Greedy 打包：對 texts 陣列用字元預算 + 段數上限雙門檻切成連續子批次，
+ * 回傳「起始 index 陣列」讓呼叫端可以對齊結果。
+ */
+function packChunks(texts) {
+  const batches = [];
+  let cur = null;
+  const flush = () => { if (cur && cur.end > cur.start) batches.push(cur); cur = null; };
+  for (let i = 0; i < texts.length; i++) {
+    const len = (texts[i] || '').length;
+    if (len > MAX_CHARS_PER_CHUNK) {
+      flush();
+      batches.push({ start: i, end: i + 1 });
+      continue;
+    }
+    if (cur && (cur.chars + len > MAX_CHARS_PER_CHUNK || (cur.end - cur.start) >= MAX_UNITS_PER_CHUNK)) {
+      flush();
+    }
+    if (!cur) cur = { start: i, end: i, chars: 0 };
+    cur.end = i + 1;
+    cur.chars += len;
+  }
+  flush();
+  return batches;
+}
 
 /** 自訂錯誤:RPD 每日配額用盡,不應該被重試。 */
 export class DailyQuotaExceededError extends Error {
@@ -106,10 +134,11 @@ export async function translateBatch(texts, settings) {
   if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0 } };
   const out = new Array(texts.length);
   const usage = { inputTokens: 0, outputTokens: 0 };
-  for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-    const slice = texts.slice(i, i + CHUNK_SIZE);
+  const chunks = packChunks(texts);
+  for (const { start, end } of chunks) {
+    const slice = texts.slice(start, end);
     const { parts, usage: u } = await translateChunk(slice, settings);
-    for (let j = 0; j < parts.length; j++) out[i + j] = parts[j];
+    for (let j = 0; j < parts.length; j++) out[start + j] = parts[j];
     usage.inputTokens += u.inputTokens;
     usage.outputTokens += u.outputTokens;
   }

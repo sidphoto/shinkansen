@@ -773,8 +773,51 @@
   }
 
   // ─── 翻譯流程 ────────────────────────────────────────
-  const CHUNK_SIZE = 20; // 每批送 Gemini 的段數（越小回饋越即時，但總請求數越多）
+  // v0.37 起改為「字元預算 + 段數上限」雙門檻的 greedy 打包，以避免單批
+  // token 數暴衝（例如 20 個 Stratechery 論述段）或 slot 過多導致 LLM
+  // 對齊失準。任一門檻先達到就封口開新批次；單段本身超過預算時獨佔一批。
+  const MAX_UNITS_PER_BATCH = 20;        // 段數上限（原 CHUNK_SIZE）
+  const MAX_CHARS_PER_BATCH = 3500;      // 字元預算，作為 token proxy（≈ 1000 英文 tokens，留 output headroom）
   const DEFAULT_MAX_CONCURRENT = 10; // content.js 側並發上限（與 background 的 rate limiter 雙重保險）
+
+  // Greedy 打包：依原順序累加段落，超過任一門檻就封口。
+  // - 字元數 > MAX_CHARS_PER_BATCH 的超大段落獨佔一批（不切段落本身，避免破壞語意）。
+  // - 順序維持原始 DOM index，確保注入位置正確。
+  function packBatches(texts, units, slotsList) {
+    const jobs = [];
+    let cur = null;
+    const flush = () => {
+      if (cur && cur.texts.length > 0) jobs.push(cur);
+      cur = null;
+    };
+    for (let i = 0; i < texts.length; i++) {
+      const len = (texts[i] || '').length;
+      // 單段就超過預算 → 獨佔一批
+      if (len > MAX_CHARS_PER_BATCH) {
+        flush();
+        jobs.push({
+          start: i,
+          texts: [texts[i]],
+          units: [units[i]],
+          slots: [slotsList[i]],
+          chars: len,
+          oversized: true,
+        });
+        continue;
+      }
+      // 若加入這段會超過任一門檻，先封口
+      if (cur && (cur.chars + len > MAX_CHARS_PER_BATCH || cur.texts.length >= MAX_UNITS_PER_BATCH)) {
+        flush();
+      }
+      if (!cur) cur = { start: i, texts: [], units: [], slots: [], chars: 0 };
+      cur.texts.push(texts[i]);
+      cur.units.push(units[i]);
+      cur.slots.push(slotsList[i]);
+      cur.chars += len;
+    }
+    flush();
+    return jobs;
+  }
 
   async function translatePage() {
     if (STATE.translated) {
@@ -827,16 +870,8 @@
     // 本次翻譯的 token / 成本累計（只算真的打 API 的部分，快取命中 = 0)
     const pageUsage = { inputTokens: 0, outputTokens: 0, costUSD: 0, cacheHits: 0 };
 
-    // 建立所有批次任務
-    const jobs = [];
-    for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-      jobs.push({
-        start: i,
-        texts: texts.slice(i, i + CHUNK_SIZE),
-        units: units.slice(i, i + CHUNK_SIZE),
-        slots: slotsList.slice(i, i + CHUNK_SIZE),
-      });
-    }
+    // 建立所有批次任務（字元預算 + 段數上限雙門檻 greedy 打包）
+    const jobs = packBatches(texts, units, slotsList);
 
     // 並行翻譯：concurrency pool。若某批失敗,該批被標記並繼續其他批。
     // 注意:回傳順序不保證,但每批注入時用自己的 els 陣列,
