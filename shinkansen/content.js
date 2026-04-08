@@ -260,22 +260,41 @@
   ].join(',');
 
   // v0.39: 判斷一個 block element 是否為「互動 widget 容器」。
-  // 若一個 block 裡面含有 <button> 或 [role="button"] / [role="link"] 的
-  // 互動控制項後代,它通常是一張卡片 / 列表項 / toolbar 而不是文字段落
-  // （例如 X 的 <li data-testid="UserCell"> 整張「Who to follow」卡）。
-  // 這種容器一旦被當成單一段落送 serializer,會產生太多 slot 導致 LLM
-  // 對齊失敗 → injector 走 textContent fallback → 整個卡片結構被壓扁,
-  // avatar / 名稱 header / 按鈕通通消失。
+  // 若一個 block 裡面含有 <button> 或 [role="button"] 的互動控制項後代,它
+  // 通常是一張卡片 / 列表項 / toolbar 而不是文字段落（例如 X 的
+  // <li data-testid="UserCell"> 整張「Who to follow」卡）。這種容器若被
+  // 當成單一段落送 serializer,會產生太多 slot 導致 LLM 對齊失敗 → injector
+  // 走 textContent fallback → 整個卡片結構被壓扁,avatar / 名稱 header /
+  // 按鈕通通消失。直接整塊 reject 即可。
   //
-  // 直接整塊 reject 即可：walker 不會降到子孫去找（反正 X 的子孫都是
-  // 非 block div,降了也收不到東西),而這類卡片裡的 bio 等副內容屬於側
-  // 欄輔助,不翻譯也比結構炸掉好太多。
+  // v0.44: 加上「文字長度短路」——若 block 本身的文字量遠超過一般 widget
+  // 卡片（閾值 300 字),則當作「文章段落含 CTA」而非 widget 卡片,放行
+  // 讓 walker 下降處理內層的真正段落。
   //
-  // 注意：role="link" 納入是為了排除 Follow / 卡片封面等整塊可點的 widget;
-  // 但不能把 <a> 本身列入（文章段落裡一定有 <a>),所以只看 [role="link"]
-  // 這個 X / Material UI 會用的 hint,不看 A tag。
+  // 動機:Gmail 打開 HTML email newsletter 時,整個郵件本文常包在一個
+  // `<td>` 裡(email 老派用 table-based layout),textLength ~1000,而且幾
+  // 乎一定含有「Continue reading / Subscribe / Read more」這類 CTA
+  // `<button>` 或 `[role="button"]`。v0.43 以前這個外層 TD 會被 widget
+  // 規則整塊 REJECT,walker 下不到內層的 `<p>`,導致整封 email 只翻到
+  // 2~3 段 Gmail UI 本身的 header/footer,郵件本文一字未翻。
+  //
+  // 閾值 300 字的選擇:
+  //   - X UserCell 的典型大小:名稱(10~40) + @handle(10~20) + bio(<=160,
+  //     Twitter 上限) ≈ 最多 ~200 字 → 維持 reject ✓
+  //   - Gmail HTML email 本文 TD ≈ 500~2000+ 字 → 放行 ✓
+  //   - Stratechery / Medium 內嵌 CTA card ≈ 50~150 字 → 維持 reject ✓
+  //   - 含 CTA 的正常長段落(Substack 預覽段+「Continue reading」)→ 放行 ✓
+  //
+  // 以前有把 `[role="link"]` 納入的意圖(排除 Follow / 卡片封面整塊可點
+  // widget),但實務上沒發現 regression,且 role="link" 在 Gmail / 其他站
+  // 容易誤傷,所以 v0.44 只保留 button / role="button" 兩種真正的互動控
+  // 制項訊號。
   function isInteractiveWidgetContainer(el) {
-    return !!el.querySelector('button, [role="button"]');
+    if (!el.querySelector('button, [role="button"]')) return false;
+    // 文字夠長就不當作 widget 卡片,讓 walker 下降處理內層真正的段落
+    const textLen = (el.innerText || '').trim().length;
+    if (textLen >= 300) return false;
+    return true;
   }
 
   // v0.40: 「nav 內容白名單」——某些 WordPress 外掛（例如 Jetpack 的相關貼文）
@@ -847,6 +866,51 @@
       if (!isCandidateText(el)) return;
       if (stats) stats.includedBySelector = (stats.includedBySelector || 0) + 1;
       results.push({ kind: 'element', el });
+    });
+
+    // v0.42: 「leaf content anchor」補抓 —— 卡片式網站（Substack / Culpium /
+    // Medium 首頁等）常把整張文章卡包在 <a> 裡,內部只有 <div class="...">
+    // 巢狀結構,完全不用 h1/h2/h3/p/article,walker 一個 block tag 都收不到。
+    // 歷史觀察:culpium.com 首頁 0 個 h2/h3/p,全頁只有 1 個 h1(站名),導致
+    // 舊版 Shinkansen 只會偵測到「1 段」。
+    //
+    // 規則(四個條件必須同時成立):
+    //   1. 是 leaf anchor —— 祖先中沒有任何 BLOCK_TAG
+    //      (一般文章內的 <a> 會有 <p> / <li> 祖先,由父 block 走正規路徑處理)
+    //   2. 本身不含 block 後代(避免吃到巨大的外層 <a>)
+    //   3. innerText 經 trim 後 >= 12 字
+    //      (擋掉「Home / Notes / Sign in / About」這類 nav 連結)
+    //   4. 通過 isVisible / isCandidateText / 排除容器 / widget 容器 / 已翻過
+    //
+    // 為什麼把這條放在 INCLUDE_BY_SELECTOR 後面而不是整合進 walker:
+    //   walker 只看 BLOCK_TAGS,改它會影響所有現有站點的行為;走補抓路徑
+    //   (跟 v0.38 的 tweetText、v0.40 的 wp-block-post-navigation-link 同路)
+    //   風險最小,且命中後直接以 element 形式加入 results,序列化與注入流程
+    //   不需要任何改動。
+    document.querySelectorAll('a').forEach(a => {
+      if (seen.has(a)) return;
+      if (a.hasAttribute('data-shinkansen-translated')) return;
+      // 條件 1:祖先無 BLOCK_TAG
+      let cur = a.parentElement;
+      let hasBlockAncestor = false;
+      while (cur && cur !== document.body) {
+        if (BLOCK_TAGS_SET.has(cur.tagName)) { hasBlockAncestor = true; break; }
+        cur = cur.parentElement;
+      }
+      if (hasBlockAncestor) return;
+      // 條件 2:本身不含 block 後代
+      if (containsBlockDescendant(a)) return;
+      // 結構性排除(nav/footer/banner role 等)與互動 widget
+      if (isInsideExcludedContainer(a)) return;
+      if (isInteractiveWidgetContainer(a)) return;
+      if (!isVisible(a)) return;
+      if (!isCandidateText(a)) return;
+      // 條件 3:文字夠長,擋掉 nav 類短連結
+      const txt = (a.innerText || '').trim();
+      if (txt.length < 12) return;
+      if (stats) stats.leafContentAnchor = (stats.leafContentAnchor || 0) + 1;
+      results.push({ kind: 'element', el: a });
+      seen.add(a);
     });
 
     return results;

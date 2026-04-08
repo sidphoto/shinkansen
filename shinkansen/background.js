@@ -270,9 +270,13 @@ async function handleTranslate(payload, sender) {
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === 'toggle-translate') {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_TRANSLATE' });
-    }
+    if (!tab?.id) return;
+    // 在 chrome://、Chrome Web Store、新分頁等頁面按快捷鍵時,該 tab 沒有
+    // content script listening,sendMessage 會 reject:
+    //   "Could not establish connection. Receiving end does not exist."
+    // 這是預期情境（使用者可能不小心按到快捷鍵),靜默吞掉即可,不讓它冒成
+    // uncaught promise rejection 污染 background.js 的錯誤面板。
+    chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_TRANSLATE' }).catch(() => {});
   }
 });
 
