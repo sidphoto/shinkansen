@@ -562,21 +562,46 @@
     return true;
   }
 
-  function collectParagraphs(root = document.body) {
+  function collectParagraphs(root = document.body, stats = null) {
+    // stats（可選,v0.30 新增）：若傳入一個物件,walker 會在每個分支結尾遞增對應
+    // 的計數 key,供 debug API / Playwright 測試診斷「為什麼某節點被跳過」。
+    // 正常翻譯流程呼叫時不傳 stats,每個分支只多一次 null 檢查,效能影響可忽略。
     const results = [];
     const seen = new Set();
 
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
       acceptNode(el) {
-        if (HARD_EXCLUDE_TAGS.has(el.tagName)) return NodeFilter.FILTER_REJECT;
-        if (el.hasAttribute('data-shinkansen-translated')) return NodeFilter.FILTER_REJECT;
-        if (!BLOCK_TAGS.includes(el.tagName)) return NodeFilter.FILTER_SKIP;
-        if (isInsideExcludedContainer(el)) return NodeFilter.FILTER_REJECT;
-        if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
+        if (HARD_EXCLUDE_TAGS.has(el.tagName)) {
+          if (stats) stats.hardExcludeTag = (stats.hardExcludeTag || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (el.hasAttribute('data-shinkansen-translated')) {
+          if (stats) stats.alreadyTranslated = (stats.alreadyTranslated || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (!BLOCK_TAGS.includes(el.tagName)) {
+          if (stats) stats.notBlockTag = (stats.notBlockTag || 0) + 1;
+          return NodeFilter.FILTER_SKIP;
+        }
+        if (isInsideExcludedContainer(el)) {
+          if (stats) stats.excludedContainer = (stats.excludedContainer || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (!isVisible(el)) {
+          if (stats) stats.invisible = (stats.invisible || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
         // 葉子優先：如果這個 block 內含其他 block tag，讓 walker 下降處理子節點，
         // 避免父層被當成翻譯單位、用 textContent 把子層元素（含圖片）清光。
-        if (containsBlockDescendant(el)) return NodeFilter.FILTER_SKIP;
-        if (!isCandidateText(el)) return NodeFilter.FILTER_REJECT;
+        if (containsBlockDescendant(el)) {
+          if (stats) stats.hasBlockDescendant = (stats.hasBlockDescendant || 0) + 1;
+          return NodeFilter.FILTER_SKIP;
+        }
+        if (!isCandidateText(el)) {
+          if (stats) stats.notCandidateText = (stats.notCandidateText || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (stats) stats.acceptedByWalker = (stats.acceptedByWalker || 0) + 1;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
@@ -593,6 +618,7 @@
       if (isInsideExcludedContainer(el)) return;
       if (!isVisible(el)) return;
       if (!isCandidateText(el)) return;
+      if (stats) stats.includedBySelector = (stats.includedBySelector || 0) + 1;
       results.push(el);
     });
 
@@ -801,18 +827,33 @@
     return parts.join(' > ');
   }
 
+  // 序列化安全的單位摘要（debug API 內部共用）
+  function unitSummary(el, i) {
+    return {
+      index: i,
+      tag: el.tagName,
+      textLength: (el.innerText || '').trim().length,
+      textPreview: (el.innerText || '').trim().slice(0, 200),
+      hasMedia: containsMedia(el),
+      selectorPath: buildSelectorPath(el),
+    };
+  }
+
   window.__shinkansen = {
     get version() { return chrome.runtime.getManifest().version; },
     // 純偵測：呼叫真實 collectParagraphs,回傳序列化安全的 plain objects
     collectParagraphs() {
-      return collectParagraphs().map((el, i) => ({
-        index: i,
-        tag: el.tagName,
-        textLength: (el.innerText || '').trim().length,
-        textPreview: (el.innerText || '').trim().slice(0, 200),
-        hasMedia: containsMedia(el),
-        selectorPath: buildSelectorPath(el),
-      }));
+      return collectParagraphs().map(unitSummary);
+    },
+    // 純偵測 + walker 分支命中統計（v0.30 新增）：回傳 { units, skipStats }
+    // 讓自動化測試能夠精準診斷「為什麼某節點被跳過」,取代先前靠鏡像 probe 計數的做法
+    collectParagraphsWithStats() {
+      const stats = {};
+      const els = collectParagraphs(document.body, stats);
+      return {
+        units: els.map(unitSummary),
+        skipStats: stats,
+      };
     },
     // 當前翻譯狀態快照
     getState() {
