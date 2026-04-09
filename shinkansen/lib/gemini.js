@@ -281,13 +281,23 @@ export async function extractGlossary(compressedText, settings) {
       type: typeof parsed,
       keys: parsed ? Object.keys(parsed).slice(0, 5) : [],
     });
-    return { glossary: [], usage, _diag: `no array in response: ${JSON.stringify(parsed).slice(0, 300)}` };
+    return { glossary: [], usage, _diag: `no array in response (rawText first 500): ${rawText.slice(0, 500)}` };
+  }
+
+  if (entries.length === 0) {
+    return { glossary: [], usage, _diag: `entries array is empty (rawText first 500): ${rawText.slice(0, 500)}` };
   }
 
   // 過濾有效 entry 並截斷到 maxTerms
   const glossary = entries
     .filter(e => e && typeof e.source === 'string' && typeof e.target === 'string' && e.source && e.target)
     .slice(0, maxTerms);
+
+  // v0.75 診斷：若有 entries 但全被過濾掉，回傳前幾筆的結構讓 content.js 能看到
+  if (entries.length > 0 && glossary.length === 0) {
+    const sampleDiag = JSON.stringify(entries.slice(0, 3)).slice(0, 500);
+    return { glossary: [], usage, _diag: `entries=${entries.length} but 0 valid (missing source/target?). samples: ${sampleDiag}` };
+  }
 
   await debugLog('info', 'glossary extraction done', {
     totalEntries: entries.length, validTerms: glossary.length, ms, finishReason,
@@ -370,7 +380,7 @@ async function translateChunk(texts, settings, glossary) {
   if (glossary && glossary.length > 0) {
     const lines = glossary.map(e => `${e.source} → ${e.target}`).join('\n');
     effectiveSystem = effectiveSystem +
-      '\n\n以下是本篇文章的術語對照表，遇到這些原文一律使用指定譯名，不可自行改寫：\n' + lines;
+      '\n\n以下是本篇文章的術語對照表，遇到這些原文一律使用指定譯名，不可自行改寫，也不需加註英文原文：\n' + lines;
   }
 
   const body = {
