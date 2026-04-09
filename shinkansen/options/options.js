@@ -515,4 +515,292 @@ $('open-shortcuts').addEventListener('click', (e) => {
   chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
 });
 
+// ═══════════════════════════════════════════════════════════
+// v0.86: Tab 切換 + 用量紀錄頁面
+// ═══════════════════════════════════════════════════════════
+
+// ─── Tab 切換 ────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const panel = $('tab-' + btn.dataset.tab);
+    if (panel) panel.classList.add('active');
+    // 切到用量頁時載入資料
+    if (btn.dataset.tab === 'usage') loadUsageData();
+  });
+});
+
+// ─── 用量頁面狀態 ────────────────────────────────────────
+let usageChart = null;
+let currentGranularity = 'day';
+
+// 預設日期範圍：近 30 天
+function initUsageDateRange() {
+  const to = new Date();
+  const from = new Date();
+  from.setDate(from.getDate() - 30);
+  $('usage-from').value = fmtDateInput(from);
+  $('usage-to').value = fmtDateInput(to);
+}
+
+function fmtDateInput(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getUsageDateRange() {
+  const fromStr = $('usage-from').value;
+  const toStr = $('usage-to').value;
+  const from = fromStr ? new Date(fromStr + 'T00:00:00').getTime() : Date.now() - 30 * 86400000;
+  const to = toStr ? new Date(toStr + 'T23:59:59.999').getTime() : Date.now();
+  return { from, to };
+}
+
+// ─── 格式化工具 ──────────────────────────────────────────
+function fmtTokens(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return String(n);
+}
+
+function fmtUSD(n) {
+  if (n >= 1) return '$' + n.toFixed(2);
+  if (n >= 0.01) return '$' + n.toFixed(3);
+  return '$' + n.toFixed(4);
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${mm}/${dd} ${hh}:${mi}`;
+}
+
+// ─── 載入用量資料 ────────────────────────────────────────
+async function loadUsageData() {
+  const { from, to } = getUsageDateRange();
+
+  // 同時載入彙總、圖表、明細
+  const [statsRes, chartRes, recordsRes] = await Promise.all([
+    chrome.runtime.sendMessage({ type: 'QUERY_USAGE_STATS', payload: { from, to } }),
+    chrome.runtime.sendMessage({ type: 'QUERY_USAGE_CHART', payload: { from, to, groupBy: currentGranularity } }),
+    chrome.runtime.sendMessage({ type: 'QUERY_USAGE', payload: { from, to } }),
+  ]);
+
+  // 彙總卡片
+  if (statsRes?.ok) {
+    const s = statsRes.stats;
+    $('usage-total-cost').textContent = fmtUSD(s.totalBilledCostUSD);
+    $('usage-total-tokens').textContent = fmtTokens(s.totalBilledInputTokens + s.totalOutputTokens);
+    $('usage-total-count').textContent = String(s.count);
+    // 找最常用模型
+    let topModel = '—';
+    let topCount = 0;
+    for (const [m, info] of Object.entries(s.byModel || {})) {
+      if (info.count > topCount) { topCount = info.count; topModel = m; }
+    }
+    $('usage-top-model').textContent = topModel;
+  }
+
+  // 折線圖
+  if (chartRes?.ok) renderChart(chartRes.data);
+
+  // 明細表格
+  if (recordsRes?.ok) renderTable(recordsRes.records);
+}
+
+// ─── 折線圖 ──────────────────────────────────────────────
+function renderChart(data) {
+  const ctx = $('usage-chart').getContext('2d');
+
+  if (usageChart) {
+    usageChart.destroy();
+    usageChart = null;
+  }
+
+  const labels = data.map(d => d.period);
+  const tokenData = data.map(d => d.totalTokens);
+  const costData = data.map(d => d.billedCostUSD);
+
+  // 計算期間合計，顯示在圖表右上角
+  const totalTokens = tokenData.reduce((s, v) => s + v, 0);
+  const totalCost = costData.reduce((s, v) => s + v, 0);
+
+  usageChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Tokens',
+          data: tokenData,
+          borderColor: '#0071e3',
+          backgroundColor: 'rgba(0, 113, 227, 0.08)',
+          fill: true,
+          tension: 0.3,
+          yAxisID: 'y',
+          pointRadius: data.length > 60 ? 0 : 3,
+          pointHoverRadius: 5,
+        },
+        {
+          label: '費用（USD）',
+          data: costData,
+          borderColor: '#34c759',
+          backgroundColor: 'rgba(52, 199, 89, 0.08)',
+          fill: true,
+          tension: 0.3,
+          yAxisID: 'y1',
+          pointRadius: data.length > 60 ? 0 : 3,
+          pointHoverRadius: 5,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'start',
+          labels: { font: { size: 11 }, boxWidth: 12, padding: 12 },
+        },
+        tooltip: {
+          callbacks: {
+            label: function(ctx) {
+              if (ctx.datasetIndex === 0) return `Tokens: ${fmtTokens(ctx.parsed.y)}`;
+              return `費用: ${fmtUSD(ctx.parsed.y)}`;
+            },
+          },
+        },
+        // Chart.js subtitle 用作期間累計顯示
+        subtitle: {
+          display: true,
+          text: `期間合計：${fmtTokens(totalTokens)} tokens / ${fmtUSD(totalCost)}`,
+          align: 'end',
+          font: { size: 11, weight: 'normal' },
+          color: '#86868b',
+          padding: { bottom: 8 },
+        },
+      },
+      scales: {
+        x: {
+          ticks: {
+            font: { size: 10 },
+            maxTicksLimit: 12,
+            maxRotation: 0,
+          },
+          grid: { display: false },
+        },
+        y: {
+          type: 'linear',
+          position: 'left',
+          beginAtZero: true,
+          ticks: {
+            font: { size: 10 },
+            callback: (v) => fmtTokens(v),
+          },
+          title: { display: true, text: 'Tokens', font: { size: 10 }, color: '#0071e3' },
+        },
+        y1: {
+          type: 'linear',
+          position: 'right',
+          beginAtZero: true,
+          grid: { drawOnChartArea: false },
+          ticks: {
+            font: { size: 10 },
+            callback: (v) => '$' + v.toFixed(2),
+          },
+          title: { display: true, text: 'USD', font: { size: 10 }, color: '#34c759' },
+        },
+      },
+    },
+  });
+}
+
+// ─── 明細表格 ────────────────────────────────────────────
+function renderTable(records) {
+  const tbody = $('usage-tbody');
+  const emptyMsg = $('usage-empty');
+
+  if (!records || records.length === 0) {
+    tbody.innerHTML = '';
+    emptyMsg.hidden = false;
+    return;
+  }
+  emptyMsg.hidden = true;
+
+  tbody.innerHTML = records.map(r => {
+    const billedTokens = (r.billedInputTokens || 0) + (r.outputTokens || 0);
+    const shortModel = (r.model || '').replace('gemini-', '').replace('-preview', '');
+    const title = escapeHtml(r.title || '(無標題)');
+    const urlDisplay = escapeHtml(shortenUrl(r.url || ''));
+    return `<tr>
+      <td>${fmtTime(r.timestamp)}</td>
+      <td>${title}<span class="site-url">${urlDisplay}</span></td>
+      <td>${shortModel}</td>
+      <td class="num">${fmtTokens(billedTokens)}</td>
+      <td class="num">${fmtUSD(r.billedCostUSD || 0)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function shortenUrl(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.length > 30 ? u.pathname.slice(0, 30) + '…' : u.pathname;
+    return u.hostname + path;
+  } catch { return url; }
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── 事件綁定 ────────────────────────────────────────────
+$('usage-from').addEventListener('change', loadUsageData);
+$('usage-to').addEventListener('change', loadUsageData);
+
+// 粒度切換
+document.querySelectorAll('.gran-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.gran-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentGranularity = btn.dataset.gran;
+    loadUsageData();
+  });
+});
+
+// 匯出 CSV
+$('usage-export-csv').addEventListener('click', async () => {
+  const { from, to } = getUsageDateRange();
+  const res = await chrome.runtime.sendMessage({ type: 'EXPORT_USAGE_CSV', payload: { from, to } });
+  if (!res?.ok) { alert('匯出失敗：' + (res?.error || '未知錯誤')); return; }
+  const blob = new Blob([res.csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const fromStr = $('usage-from').value.replace(/-/g, '');
+  const toStr = $('usage-to').value.replace(/-/g, '');
+  a.href = url;
+  a.download = `shinkansen-usage-${fromStr}-${toStr}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// 清除紀錄
+$('usage-clear').addEventListener('click', async () => {
+  if (!confirm('確定要清除所有翻譯用量紀錄嗎？\n此操作無法復原。')) return;
+  const res = await chrome.runtime.sendMessage({ type: 'CLEAR_USAGE' });
+  if (res?.ok) {
+    loadUsageData();
+  } else {
+    alert('清除失敗：' + (res?.error || '未知錯誤'));
+  }
+});
+
+// ─── 初始化 ──────────────────────────────────────────────
+initUsageDateRange();
 load();

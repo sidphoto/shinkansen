@@ -7,7 +7,16 @@
 </head>
 <body>
   <div class="container">
-    <h1>🚄 Shinkansen 設定</h1>
+    <h1>🚄 Shinkansen</h1>
+
+    <!-- v0.86: Tab 切換列 -->
+    <nav class="tab-bar">
+      <button class="tab-btn active" data-tab="settings">設定</button>
+      <button class="tab-btn" data-tab="usage">用量紀錄</button>
+    </nav>
+
+    <!-- ═══ 設定分頁 ═══ -->
+    <div id="tab-settings" class="tab-panel active">
 
     <section>
       <h2>Gemini API</h2>
@@ -210,8 +219,82 @@
       <button id="save" class="primary">儲存設定</button>
       <span id="save-status"></span>
     </div>
+
+    </div><!-- /tab-settings -->
+
+    <!-- ═══ 用量紀錄分頁 ═══ -->
+    <div id="tab-usage" class="tab-panel">
+
+      <!-- 日期範圍與粒度選擇 -->
+      <div class="usage-controls">
+        <label class="usage-date-label">
+          從
+          <input type="date" id="usage-from">
+        </label>
+        <label class="usage-date-label">
+          到
+          <input type="date" id="usage-to">
+        </label>
+        <div class="usage-granularity">
+          <button class="gran-btn active" data-gran="day">日</button>
+          <button class="gran-btn" data-gran="week">週</button>
+          <button class="gran-btn" data-gran="month">月</button>
+        </div>
+      </div>
+
+      <!-- 彙總卡片 -->
+      <div class="usage-summary">
+        <div class="summary-card">
+          <div class="summary-value" id="usage-total-cost">$0.00</div>
+          <div class="summary-label">累計費用（USD）</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-value" id="usage-total-tokens">0</div>
+          <div class="summary-label">計費 Tokens</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-value" id="usage-total-count">0</div>
+          <div class="summary-label">翻譯次數</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-value" id="usage-top-model">—</div>
+          <div class="summary-label">最常用模型</div>
+        </div>
+      </div>
+
+      <!-- 折線圖 -->
+      <div class="chart-container">
+        <canvas id="usage-chart"></canvas>
+      </div>
+
+      <!-- 紀錄表格 -->
+      <div class="usage-table-wrapper">
+        <table class="usage-table" id="usage-table">
+          <thead>
+            <tr>
+              <th>時間</th>
+              <th>網站</th>
+              <th>模型</th>
+              <th class="num">Tokens</th>
+              <th class="num">費用</th>
+            </tr>
+          </thead>
+          <tbody id="usage-tbody"></tbody>
+        </table>
+        <p class="muted" id="usage-empty" hidden>此期間沒有翻譯紀錄</p>
+      </div>
+
+      <!-- 操作按鈕 -->
+      <div class="btn-row" style="margin-top: 16px;">
+        <button id="usage-export-csv" class="secondary">匯出 CSV</button>
+        <button id="usage-clear" class="secondary" style="color: #ff3b30; border-color: #ff3b30;">清除紀錄</button>
+      </div>
+
+    </div><!-- /tab-usage -->
+
   </div>
 
+  <script src="../lib/vendor/chart.min.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

@@ -7,6 +7,7 @@ import { debugLog } from './lib/logger.js';
 import * as cache from './lib/cache.js';
 import { RateLimiter } from './lib/rate-limiter.js';
 import { getLimitsForSettings } from './lib/tier-limits.js';
+import * as usageDB from './lib/usage-db.js'; // v0.86: 用量紀錄 IndexedDB
 
 console.log('[Shinkansen] background service worker started');
 
@@ -215,6 +216,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'CLEAR_BADGE') {
     clearTranslatedBadge(sender?.tab?.id)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  // ─── v0.86: 用量紀錄相關訊息 ──────────────────────────
+  if (message?.type === 'LOG_USAGE') {
+    (async () => {
+      // 由 background 端補上 model（content.js 不知道目前模型）
+      const settings = await getSettings();
+      const record = {
+        ...message.payload,
+        model: settings.geminiConfig?.model || 'unknown',
+      };
+      await usageDB.logTranslation(record);
+      sendResponse({ ok: true });
+    })().catch((err) => {
+      console.warn('[Shinkansen] LOG_USAGE failed', err);
+      sendResponse({ ok: false, error: err.message });
+    });
+    return true;
+  }
+  if (message?.type === 'QUERY_USAGE') {
+    usageDB.query(message.payload || {})
+      .then((records) => sendResponse({ ok: true, records }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  if (message?.type === 'QUERY_USAGE_STATS') {
+    usageDB.getStats(message.payload || {})
+      .then((stats) => sendResponse({ ok: true, stats }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  if (message?.type === 'QUERY_USAGE_CHART') {
+    usageDB.getAggregated(message.payload || {})
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  if (message?.type === 'EXPORT_USAGE_CSV') {
+    usageDB.exportCSV(message.payload || {})
+      .then((csv) => sendResponse({ ok: true, csv }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  if (message?.type === 'CLEAR_USAGE') {
+    const p = message.payload || {};
+    const promise = p.beforeTimestamp ? usageDB.clearBefore(p.beforeTimestamp) : usageDB.clearAll();
+    promise
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;

@@ -156,19 +156,6 @@ $('options-btn').addEventListener('click', () => {
   chrome.runtime.openOptionsPage();
 });
 
-$('reset-usage-btn').addEventListener('click', async () => {
-  if (!confirm('確定要重置累計翻譯統計嗎？此操作只歸零 token 計數與費用，不會動到翻譯快取。')) return;
-  const resp = await chrome.runtime.sendMessage({ type: 'RESET_USAGE' });
-  if (resp?.ok) {
-    statusEl.textContent = '狀態：已重置累計統計';
-    statusEl.style.color = '#34c759';
-    refreshUsageInfo();
-  } else {
-    statusEl.textContent = '狀態：重置失敗 — ' + (resp?.error || '未知錯誤');
-    statusEl.style.color = '#ff3b30';
-  }
-});
-
 $('clear-cache-btn').addEventListener('click', async () => {
   if (!confirm('確定要清除所有翻譯快取嗎？清除後下次翻譯會重新呼叫 Gemini。')) return;
   const resp = await chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' });

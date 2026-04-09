@@ -1399,6 +1399,7 @@
     // v0.80: 設定翻譯進行中旗標與 AbortController
     STATE.translating = true;
     STATE.abortController = new AbortController();
+    const translateStartTime = Date.now(); // v0.86: 計時用於用量紀錄
     const abortSignal = STATE.abortController.signal;
 
     let units = collectParagraphs();
@@ -1623,6 +1624,26 @@
           stopTimer: true,
           detail,
         });
+      }
+
+      // v0.86: 記錄用量到 IndexedDB（fire-and-forget，不阻塞 UI）
+      if (done > 0) {
+        chrome.runtime.sendMessage({
+          type: 'LOG_USAGE',
+          payload: {
+            url: location.href,
+            title: document.title,
+            inputTokens: pageUsage.inputTokens,
+            outputTokens: pageUsage.outputTokens,
+            cachedTokens: pageUsage.cachedTokens,
+            billedInputTokens: pageUsage.billedInputTokens,
+            billedCostUSD: pageUsage.billedCostUSD,
+            segments: total,
+            cacheHits: pageUsage.cacheHits,
+            durationMs: Date.now() - translateStartTime,
+            timestamp: Date.now(),
+          },
+        }).catch(() => {}); // 靜默：紀錄失敗不影響使用者體驗
       }
 
       // v0.45: 安排延遲 rescan 補抓 hydration 後才 render 的內容
