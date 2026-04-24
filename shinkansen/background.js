@@ -3,6 +3,7 @@
 
 import { browser } from './lib/compat.js';
 import { translateBatch, extractGlossary } from './lib/gemini.js';
+import { translateBatch as translateBatchMiniMax, extractGlossary as extractGlossaryMiniMax } from './lib/minimax.js';
 import { translateGoogleBatch } from './lib/google-translate.js';
 import { getSettings, DEFAULT_SUBTITLE_SYSTEM_PROMPT } from './lib/storage.js';
 import { debugLog, getLogs, clearLogs, getPersistedLogs, clearPersistedLogs } from './lib/logger.js';
@@ -229,6 +230,11 @@ const messageHandlers = {
   TRANSLATE_BATCH: {
     async: true,
     handler: (payload, sender) => {
+      // v1.5.0: engine routing — minimax / gemini / google
+      const engine = payload?.engine;
+      if (engine === 'minimax') {
+        return handleTranslateMiniMax(payload, sender);
+      }
       // v1.4.12: preset 快速鍵可傳 modelOverride 覆蓋 geminiConfig.model，
       // 其他欄位（prompt、temperature）沿用全域設定。沿用既有 geminiOverrides 機制。
       const overrides = payload?.modelOverride ? { model: payload.modelOverride } : {};
@@ -650,6 +656,115 @@ async function handleTranslate(payload, sender, geminiOverrides = {}, pricingOve
     rpdExceeded: acquireResult?.rpdExceeded || false,
     // v0.94: 本批翻譯是否觸發了 segment mismatch fallback
     hadMismatch: batchHadMismatch,
+  };
+}
+
+
+// ─── v1.5.0: MiniMax 批次處理 ─────────────────────────────
+// 支援 engine='minimax' 的翻譯請求。
+// 使用 minimaxApiKey（storage.local），單獨存放區。
+async function handleTranslateMiniMax(payload, sender) {
+  const texts = payload?.texts;
+  if (!Array.isArray(texts) || texts.length === 0) {
+    return { result: [], usage: { engine: 'minimax', chars: 0 } };
+  }
+
+  // v1.5.0: MiniMax API Key 单独从 storage.local 读取
+  const { minimaxApiKey } = await browser.storage.local.get('minimaxApiKey');
+  if (!minimaxApiKey) {
+    throw new Error('尚未設定 MiniMax API Key，請至設定頁填入。');
+  }
+
+  const settings = await getSettings();
+  const effectiveSettings = {
+    ...settings,
+    apiKey: minimaxApiKey,
+    minimaxConfig: settings.minimaxConfig || {
+      model: 'MiniMax-M2.7',
+      temperature: 1.0,
+      topP: 0.95,
+      maxOutputTokens: 8192,
+      systemInstruction: settings.geminiConfig?.systemInstruction || '',
+    },
+    glossary: payload?.glossary || null,
+  };
+
+  // v1.5.0: 讀取固定術語表（與 Gemini 相同邏輯）
+  let fixedGlossaryEntries = null;
+  const fg = settings.fixedGlossary;
+  if (fg) {
+    const globalEntries = Array.isArray(fg.global) ? fg.global.filter(e => e.source && e.target) : [];
+    let domainEntries = [];
+    if (fg.byDomain && sender?.tab?.url) {
+      try {
+        const hostname = new URL(sender.tab.url).hostname;
+        domainEntries = Array.isArray(fg.byDomain[hostname]) ? fg.byDomain[hostname].filter(e => e.source && e.target) : [];
+      } catch { /* skip */ }
+    }
+    if (globalEntries.length > 0 || domainEntries.length > 0) {
+      const merged = new Map();
+      for (const e of globalEntries) merged.set(e.source, e.target);
+      for (const e of domainEntries) merged.set(e.source, e.target);
+      fixedGlossaryEntries = [...merged.entries()].map(([source, target]) => ({ source, target }));
+    }
+  }
+
+  // 1. 先查快取（key suffix = _mm）
+  const cacheSuffix = '_mm_mMiniMax-M2.7';
+  const cached = await cache.getBatch(texts, cacheSuffix);
+  const missingIdxs = [];
+  const missingTexts = [];
+  cached.forEach((tr, i) => {
+    if (tr == null) { missingIdxs.push(i); missingTexts.push(texts[i]); }
+  });
+
+  const cacheHits = texts.length - missingTexts.length;
+  debugLog('info', 'cache', 'minimax batch cache lookup', {
+    total: texts.length, hits: cacheHits, misses: missingTexts.length,
+  });
+
+  // 2. 缺失的部分送 MiniMax API
+  let fresh = [];
+  let batchUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  let batchCostUSD = 0;
+  if (missingTexts.length > 0) {
+    const t0 = Date.now();
+    const totalChars = missingTexts.reduce((s, t) => s + (t?.length || 0), 0);
+    debugLog('info', 'api', 'minimax translateBatch start', { count: missingTexts.length, chars: totalChars });
+    try {
+      const res = await translateBatchMiniMax(missingTexts, effectiveSettings, effectiveSettings.glossary, fixedGlossaryEntries);
+      fresh = res.translations || [];
+      batchUsage = res.usage || { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+    } catch (err) {
+      debugLog('error', 'api', 'minimax translateBatch failed', { error: err.message });
+      throw err;
+    }
+    const ms = Date.now() - t0;
+    // MiniMax 計價：使用 settings.minimaxPricing（v1.5.0 已寫入 storage）
+    const mp = settings.minimaxPricing || { inputPerMTok: 0.5, outputPerMTok: 3.0 };
+    batchCostUSD = (batchUsage.inputTokens / 1_000_000) * mp.inputPerMTok
+                + (batchUsage.outputTokens / 1_000_000) * mp.outputPerMTok;
+    debugLog('info', 'api', 'minimax translateBatch done', {
+      count: missingTexts.length, chars: totalChars, elapsed: ms,
+      inputTokens: batchUsage.inputTokens, outputTokens: batchUsage.outputTokens, costUSD: batchCostUSD,
+    });
+  }
+
+  // 3. 寫回快取
+  if (fresh.length > 0) {
+    await cache.setBatch(missingTexts, fresh, cacheSuffix);
+  }
+
+  // 4. 合併快取命中與新翻譯
+  const result = texts.map((_, i) => missingIdxs.includes(i) ? fresh[missingIdxs.indexOf(i)] : cached[i]);
+  const totalCharsAll = texts.reduce((s, t) => s + (t?.length || 0), 0);
+  debugLog('info', 'api', 'minimax handleTranslate done', {
+    total: texts.length, cacheHits, fresh: missingTexts.length, chars: totalCharsAll,
+  });
+
+  return {
+    result,
+    usage: { engine: 'minimax', inputTokens: batchUsage.inputTokens, outputTokens: batchUsage.outputTokens, cachedTokens: batchUsage.cachedTokens || 0, costUSD: batchCostUSD, chars: totalCharsAll },
   };
 }
 
