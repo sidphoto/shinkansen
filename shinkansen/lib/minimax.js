@@ -11,6 +11,17 @@ const MAX_CHARS_PER_CHUNK = DEFAULT_CHARS_PER_BATCH;
 const MAX_BACKOFF_MS = 8000;
 
 /**
+ * Prompt Injection 防護：將可疑的「忽略先前指令」模式置換為 [removed]。
+ * 套用於所有用戶文字進入 system prompt 或 extraction prompt 之前。
+ */
+function sanitizeForPrompt(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text.replace(/ignore\s+(previous|all)\s+instructions?/gi, '[removed]');
+}
+
+
+
+/**
  * Greedy 打包：對 texts 陣列用字元預算 + 段數上限雙門檻切成連續子批次，
  * 回傳「起始 index 陣列」讓呼叫端可以對齊結果。
  */
@@ -133,7 +144,7 @@ export async function extractGlossary(compressedText, settings) {
       { role: 'system', content: glossaryPrompt },
       { role: 'user', content: `請從以下文章摘要中提取專有名詞對照表（最多${maxTerms}組），回傳 JSON 格式：{"glossary":[{"source":"英文","target":"中文","type":"name|term|org"}]}
 文章摘要：
-${compressedText}` }
+${sanitizeForPrompt(compressedText || '')}` }
     ],
     temperature: glossaryTemperature,
     max_tokens: glossaryMaxOutput,
@@ -253,21 +264,24 @@ ${compressedText}` }
  * 組合最終的 system instruction。
  */
 function buildEffectiveSystemInstruction(baseSystem, texts, joined, glossary, fixedGlossary) {
+  // P1 Security: sanitize all user texts before embedding in system prompt
+  const sanitizedTexts = texts.map(t => sanitizeForPrompt(t || ''));
+  const sanitizedJoined = sanitizeForPrompt(joined || '');
   const parts = [baseSystem];
 
-  if (texts.length > 1) {
+  if (sanitizedTexts.length > 1) {
     parts.push(
-      `額外規則（多段翻譯分隔符與序號，極重要）:\n本批次包含 ${texts.length} 段文字。每段開頭有序號標記 «N»（N 為 1 到 ${texts.length}），段與段之間以分隔符 <<<SHINKANSEN_SEP>>> 隔開。\n你的輸出必須：\n- 每段譯文開頭也加上對應的序號標記 «N»（N 與輸入的序號一一對應）\n- 段與段之間用完全相同的分隔符 <<<SHINKANSEN_SEP>>> 隔開\n- 恰好輸出 ${texts.length} 段譯文和 ${texts.length - 1} 個分隔符\n- 不可合併段落、不可省略分隔符、不可增減段數`
+      `額外規則（多段翻譯分隔符與序號，極重要）:\n本批次包含 ${sanitizedTexts.length} 段文字。每段開頭有序號標記 «N»（N 為 1 到 ${sanitizedTexts.length}），段與段之間以分隔符 <<<SHINKANSEN_SEP>>> 隔開。\n你的輸出必須：\n- 每段譯文開頭也加上對應的序號標記 «N»（N 與輸入的序號一一對應）\n- 段與段之間用完全相同的分隔符 <<<SHINKANSEN_SEP>>> 隔開\n- 恰好輸出 ${sanitizedTexts.length} 段譯文和 ${sanitizedTexts.length - 1} 個分隔符\n- 不可合併段落、不可省略分隔符、不可增減段數`
     );
   }
 
-  if (texts.some(t => t && t.indexOf('\n') !== -1)) {
+  if (sanitizedTexts.some(t => t && t.indexOf('\n') !== -1)) {
     parts.push(
       '額外規則（段落分隔）:\n輸入中可能含有段內換行符 \\n（例如 "第一段\\n\\n第二段"）,代表原文有對應的段落或行分隔（通常是 <br> 或 <br><br>）。翻譯時必須在對應位置原樣保留 \\n 字元——譯文段落數與輸入段落數一致,連續兩個 \\n 也要保留兩個。不可把段落合併成一行,也不可把空白行多塞或少塞。'
     );
   }
 
-  if (joined.indexOf('\u27E6') !== -1) {
+  if (sanitizedJoined.indexOf('\u27E6') !== -1) {
     parts.push(
       '額外規則（極重要，處理佔位符標記）:\n輸入中可能含有兩種佔位符標記，都是用來保留原文結構，必須原樣保留、不可翻譯、不可省略、不可改寫、不可新增、不可重排。佔位符裡的數字、斜線、星號 **必須是半形 ASCII 字元**（0-9、/、*），絕對不可改成全形（０-９、／、＊），否則程式無法配對會整段崩壞。\n\n（A）配對型 ⟦數字⟧…⟦/數字⟧（例如 ⟦0⟧Tokugawa Ieyasu⟦/0⟧）：\n- 把標記視為透明外殼。外殼「內部」的文字跟外殼「外部」的文字一樣，全部都要翻譯成繁體中文。\n- ⟦數字⟧ 與 ⟦/數字⟧ 兩個標記本身原樣保留，數字不變。\n- **配對型可以巢狀嵌套**（例如 ⟦0⟧may incorporate text from a ⟦1⟧large language model⟦/1⟧, which is ...⟦/0⟧）。巢狀代表原文是 `<b>text <a>link</a> more text</b>` 這類嵌套結構。翻譯時必須**同時**保留外層與內層兩組標記、不可扁平化成單層、不可交換順序、不可遺漏任何一層。外層與內層的內部文字全部要翻成繁體中文。\n\n（B）自閉合 ⟦*數字⟧（例如 ⟦*5⟧）：\n- 這是「原子保留」位置記號，代表原文裡有一段不可翻譯的小區塊（例如維基百科腳註參照 [2])。\n- 整個 ⟦*數字⟧ token 原樣保留，不可拆開、不可翻譯、不可省略，數字不變。\n- 它的位置代表那段內容應該插在譯文的哪裡。\n\n具體範例 1（單層）：\n輸入： ⟦0⟧Tokugawa Ieyasu⟦/0⟧ won the ⟦1⟧Battle of Sekigahara⟦/1⟧ in 1600.⟦*2⟧\n正確輸出： ⟦0⟧德川家康⟦/0⟧於 1600 年贏得⟦1⟧關原之戰⟦/1⟧。⟦*2⟧\n錯誤輸出 1： ⟦0⟧Tokugawa Ieyasu⟦/0⟧於 1600 年贏得⟦1⟧Battle of Sekigahara⟦/1⟧。⟦*2⟧（配對型內部英文沒翻）\n錯誤輸出 2： ⟦0⟧德川家康⟦/0⟧於 1600 年贏得⟦1⟧關原之戰⟦/1⟧。[2]（自閉合 ⟦*2⟧ 被擅自還原成 [2]）\n\n具體範例 2（巢狀）：\n輸入： This article ⟦0⟧may incorporate text from a ⟦1⟧large language model⟦/1⟧, which is ⟦2⟧prohibited in Wikipedia articles⟦/2⟧⟦/0⟧.\n正確輸出： 本條目⟦0⟧可能包含來自⟦1⟧大型語言模型⟦/1⟧的文字，這在⟦2⟧維基百科條目中是被禁止的⟦/2⟧⟦/0⟧。\n錯誤輸出 3： 本條目可能包含來自⟦1⟧大型語言模型⟦/1⟧的文字，這在⟦2⟧維基百科條目中是被禁止的⟦/2⟧。（外層 ⟦0⟧…⟦/0⟧ 被扁平化丟掉）'
     );
@@ -321,7 +335,7 @@ export async function translate(texts, settings) {
     model,
     messages: [
       { role: 'system', content: effectiveSystem },
-      { role: 'user', content: joined },
+      { role: 'user', content: sanitizeForPrompt(joined || '') },
     ],
     temperature,
     top_p: topP,
