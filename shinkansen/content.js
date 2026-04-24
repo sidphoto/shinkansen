@@ -192,7 +192,7 @@
 
   // ─── translateUnits ──────────────────────────────────
 
-  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride } = {}) {
+  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride, engine } = {}) {
     const total = units.length;
     const serialized = units.map(unit => {
       if (unit.kind === 'fragment') {
@@ -250,8 +250,8 @@
         const response = await Promise.race([
           browser.runtime.sendMessage({
             type: 'TRANSLATE_BATCH',
-            // v1.4.12: modelOverride 來自 preset 快速鍵，覆蓋全域 geminiConfig.model
-            payload: { texts: job.texts, glossary: glossary || null, modelOverride: modelOverride || null },
+            // v1.5.0: engine 來自 preset（minimax），modelOverride 來自 Gemini 模式 preset
+            payload: { texts: job.texts, glossary: glossary || null, modelOverride: modelOverride || null, engine: engine || null },
           }),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error(`批次逾時（${BATCH_TIMEOUT_MS / 1000}s）`)), BATCH_TIMEOUT_MS)
@@ -511,6 +511,7 @@
         glossary,
         signal: abortSignal,
         modelOverride: options.modelOverride || null,
+        engine: options.engine || null,
         onProgress: (d, t, mismatch) => SK.showToast('loading', `${labelPrefix}翻譯中… ${d} / ${t}`, {
           progress: d / t,
           mismatch: !!mismatch,
@@ -930,6 +931,9 @@
     }
     if (preset.engine === 'google') {
       SK.translatePageGoogle({ slot, label: preset.label || null });
+    } else if (preset.engine === 'minimax') {
+      // v1.5.0: MiniMax — 讀取翻譯區塊直接送 TRANSLATE_BATCH engine=minimax，不走 modelOverride
+      SK.translatePage({ slot, label: preset.label || null, engine: 'minimax' });
     } else {
       SK.translatePage({ modelOverride: preset.model || null, slot, label: preset.label || null });
     }
