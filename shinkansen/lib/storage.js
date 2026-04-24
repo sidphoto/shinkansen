@@ -72,6 +72,20 @@ export const DEFAULT_SUBTITLE_SYSTEM_PROMPT = `你是專業的影片字幕翻譯
 8. 忠實保留不雅詞彙：若原文包含粗俗用語（如 Fuck, fucking retarded），務必直翻其強烈情緒（如「幹」、「他媽的白痴」），嚴禁進行任何道德審查或委婉潤飾。
 </critical_rules>`;
 
+// v1.5.0: MiniMax API 預設設定
+export const DEFAULT_MINIMAX_CONFIG = {
+  model: 'MiniMax-M2.7',
+  temperature: 1.0,
+  topP: 0.95,
+  maxOutputTokens: 8192,
+};
+
+// MiniMax 計價（USD per 1M tokens）- 官方報價
+export const DEFAULT_MINIMAX_PRICING = {
+  inputPerMTok: 0.5,
+  outputPerMTok: 3.0,
+};
+
 export const DEFAULT_SETTINGS = {
   apiKey: '',
   geminiConfig: {
@@ -81,6 +95,11 @@ export const DEFAULT_SETTINGS = {
     topP: 0.95,
     topK: 40,             // Gemini 3 Flash 原廠預設值（Pro 系列為 64）
     maxOutputTokens: 8192,
+    systemInstruction: DEFAULT_SYSTEM_PROMPT,
+  },
+  // v1.5.0: MiniMax API 設定（與 geminiConfig 並列）
+  minimaxConfig: {
+    ...DEFAULT_MINIMAX_CONFIG,
     systemInstruction: DEFAULT_SYSTEM_PROMPT,
   },
   // 計價設定（USD per 1M tokens)。預設值為 gemini-3-flash-preview 的官方報價，
@@ -149,7 +168,8 @@ export const DEFAULT_SETTINGS = {
   skipTraditionalChinesePage: true,
   // v1.4.12: 三組翻譯預設對應 Alt+A / Alt+S / Alt+D 三個快速鍵。
   // engine='gemini' 時 model 覆蓋 geminiConfig.model，其他欄位（prompt、temperature、glossary）沿用全域；
-  // engine='google' 時走 Google Translate 路徑，不需 model。
+  // engine='google' 時走 Google Translate 路徑，不需 model；
+  // engine='minimax' 時使用 minimaxConfig.model，計價用 minimaxConfig.pricing。
   // label 顯示於 options 頁（未來 toast 也可用）。
   // 行為：閒置按 → 啟動對應 preset；翻譯中按 → abort；已翻譯按任意 → restorePage。
   translatePresets: [
@@ -157,6 +177,11 @@ export const DEFAULT_SETTINGS = {
     { slot: 2, engine: 'gemini', model: 'gemini-3-flash-preview', label: 'Flash' },
     { slot: 3, engine: 'google', model: null, label: 'Google MT' },
   ],
+  // v1.5.0: MiniMax API 專用計價設定
+  minimaxPricing: {
+    inputPerMTok: 0.5,
+    outputPerMTok: 3.0,
+  },
 };
 
 // v0.62 起：apiKey 改存 browser.storage.local，不走 Google 帳號跨裝置同步。
@@ -187,6 +212,7 @@ export async function getSettings() {
     ...DEFAULT_SETTINGS,
     ...saved,
     geminiConfig: { ...DEFAULT_SETTINGS.geminiConfig, ...(saved.geminiConfig || {}) },
+    minimaxConfig: { ...DEFAULT_SETTINGS.minimaxConfig, ...(saved.minimaxConfig || {}) },
     pricing: { ...DEFAULT_SETTINGS.pricing, ...(saved.pricing || {}) },
     domainRules: { ...DEFAULT_SETTINGS.domainRules, ...(saved.domainRules || {}) },
     glossary: { ...DEFAULT_SETTINGS.glossary, ...(saved.glossary || {}) },
@@ -197,6 +223,8 @@ export async function getSettings() {
     translatePresets: (Array.isArray(saved.translatePresets) && saved.translatePresets.length > 0)
       ? saved.translatePresets
       : DEFAULT_SETTINGS.translatePresets,
+    // v1.5.0: minimaxPricing
+    minimaxPricing: { ...DEFAULT_SETTINGS.minimaxPricing, ...(saved.minimaxPricing || {}) },
   };
   merged.apiKey = apiKey;
   return merged;
